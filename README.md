@@ -41,6 +41,6 @@ These are local, small-sample results for the stated target, runtime, prompts, a
 
 Original release scripts and documentation are staged under Apache-2.0. Patch files are modifications to their respective upstream projects and remain subject to the upstream notices preserved in `third_party_licenses/`.
 
-## Publication status
+## Release pair
 
-This code package and its paired model artifacts are staged privately for final release review. Model weights and checksums: <https://huggingface.co/D4pp3rD1scourse/Qwen3.5-122B-A10B-Uncensored-HauhauCS-Aggressive-DFlash>.
+This repository contains the code, patches, and reproducibility record. Paired model weights, metadata, and checksums: <https://huggingface.co/D4pp3rD1scourse/Qwen3.5-122B-A10B-Uncensored-HauhauCS-Aggressive-DFlash>. Use the draft only with the linked target and compatible patched runtime.
