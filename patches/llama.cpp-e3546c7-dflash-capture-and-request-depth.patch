@@ -1,0 +1,220 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 580728a..cfb7310 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -13,10 +13,14 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
++#include <string>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -449,6 +453,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+ 
+     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
+     std::vector<float> features_buf;
++
+     std::vector<float> g_embd_buf;
+ 
+     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
+@@ -921,6 +926,70 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
+     std::vector<float> features_buf;
+ 
++    // Internal research capture. Disabled unless QDL_CAPTURE_PATH is set.
++    std::ofstream capture_stream;
++    std::string capture_path;
++    std::string capture_final_path;
++    std::string capture_partial_path;
++    std::vector<uint16_t> capture_bf16_buf;
++    uint64_t capture_rows = 0;
++    uint64_t capture_shard_rows = 0;
++    uint64_t capture_max_rows = 0;
++    uint64_t capture_shard_max_rows = 0;
++    uint32_t capture_shard_index = 0;
++    bool capture_rotate = false;
++    bool capture_enabled = false;
++
++    void capture_open_shard() {
++        char suffix[32];
++        std::snprintf(suffix, sizeof(suffix), ".%06u.qdlhs", capture_shard_index);
++        capture_final_path = capture_rotate ? capture_path + suffix : capture_path;
++        capture_partial_path = capture_final_path + ".partial";
++        std::ifstream existing(capture_final_path, std::ios::binary);
++        if (existing.good()) {
++            throw std::runtime_error("refusing to overwrite completed QDL shard: " + capture_final_path);
++        }
++        std::ifstream partial_existing(capture_partial_path, std::ios::binary);
++        if (partial_existing.good()) {
++            throw std::runtime_error("refusing to overwrite interrupted QDL shard: " + capture_partial_path);
++        }
++        capture_stream.open(capture_partial_path, std::ios::binary | std::ios::trunc);
++        if (!capture_stream) {
++            throw std::runtime_error("failed to open QDL capture path: " + capture_partial_path);
++        }
++
++        const char magic[8] = {'Q', 'D', 'L', 'H', 'S', '0', '1', '\0'};
++        const uint32_t schema = 1;
++        const uint32_t dtype = 2;
++        const uint32_t layer_count = target_layer_ids_n;
++        const uint32_t hidden_width = (uint32_t) n_embd_tgt;
++        const uint64_t rows_placeholder = 0;
++        capture_stream.write(magic, sizeof(magic));
++        capture_stream.write(reinterpret_cast<const char *>(&schema), sizeof(schema));
++        capture_stream.write(reinterpret_cast<const char *>(&dtype), sizeof(dtype));
++        capture_stream.write(reinterpret_cast<const char *>(&layer_count), sizeof(layer_count));
++        capture_stream.write(reinterpret_cast<const char *>(&hidden_width), sizeof(hidden_width));
++        capture_stream.write(reinterpret_cast<const char *>(&rows_placeholder), sizeof(rows_placeholder));
++        capture_stream.write(reinterpret_cast<const char *>(target_layer_ids), sizeof(int32_t) * target_layer_ids_n);
++        capture_shard_rows = 0;
++    }
++
++    void capture_finalize_shard() {
++        if (!capture_stream.is_open()) {
++            return;
++        }
++        capture_stream.flush();
++        capture_stream.seekp(24, std::ios::beg);
++        capture_stream.write(reinterpret_cast<const char *>(&capture_shard_rows), sizeof(capture_shard_rows));
++        capture_stream.flush();
++        capture_stream.close();
++        if (std::rename(capture_partial_path.c_str(), capture_final_path.c_str()) != 0) {
++            throw std::runtime_error("QDL capture failed to finalize: " + capture_final_path);
++        }
++        LOG_INF("%s: QDL shard finalized path=%s tokens=%" PRIu64 "\n",
++                __func__, capture_final_path.c_str(), capture_shard_rows);
++    }
++
+     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, n_seq)
+         , params(params.draft)
+@@ -954,6 +1023,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
+ 
++        const char * capture_path_env = std::getenv("QDL_CAPTURE_PATH");
++        if (capture_path_env && capture_path_env[0] != '\0') {
++            const char * max_rows = std::getenv("QDL_CAPTURE_MAX_TOKENS");
++            capture_max_rows = max_rows ? std::strtoull(max_rows, nullptr, 10) : 64;
++            const char * shard_rows = std::getenv("QDL_CAPTURE_SHARD_TOKENS");
++            capture_shard_max_rows = shard_rows ? std::strtoull(shard_rows, nullptr, 10) : capture_max_rows;
++            if (capture_max_rows == 0) {
++                LOG_WRN("%s: QDL capture disabled because QDL_CAPTURE_MAX_TOKENS=0\n", __func__);
++            } else {
++                capture_path = capture_path_env;
++                if (capture_shard_max_rows == 0) {
++                    throw std::runtime_error("QDL_CAPTURE_SHARD_TOKENS must be positive");
++                }
++                capture_rotate = shard_rows != nullptr;
++                capture_open_shard();
++                capture_bf16_buf.resize((size_t) n_embd_enc);
++                capture_enabled = true;
++                LOG_INF("%s: QDL capture enabled path=%s max_tokens=%" PRIu64 " shard_tokens=%" PRIu64 " layers=%u width=%d\n",
++                        __func__, capture_path.c_str(), capture_max_rows, capture_shard_max_rows, target_layer_ids_n, n_embd_tgt);
++            }
++        }
++
+         // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
+         if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
+             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained DFlash block size %d -- clamping to %d\n",
+@@ -984,6 +1075,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     }
+ 
+     ~common_speculative_impl_draft_dflash() override {
++        if (capture_enabled) {
++            try {
++                capture_finalize_shard();
++            } catch (const std::exception & err) {
++                LOG_ERR("%s: %s\n", __func__, err.what());
++            }
++            LOG_INF("%s: QDL capture finalized tokens=%" PRIu64 "\n", __func__, capture_rows);
++        }
+         llama_batch_free(batch);
+         llama_batch_free(batch_inject);
+     }
+@@ -1060,6 +1159,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     }
+                 }
+ 
++                if (capture_enabled && capture_rows < capture_max_rows) {
++                    const uint64_t remaining = capture_max_rows - capture_rows;
++                    const int32_t n_capture = (int32_t) std::min<uint64_t>((uint64_t) n_chunk, remaining);
++                    for (int32_t i = 0; i < n_capture; ++i) {
++                        const int32_t batch_idx = i_batch_beg[seq_id] + offset + i;
++                        const int32_t seq = seq_id;
++                        const int32_t pos = batch_in.pos[batch_idx];
++                        const int32_t token = batch_in.token[batch_idx];
++                        const float * features = features_buf.data() + (size_t) i * n_embd_enc;
++                        capture_stream.write(reinterpret_cast<const char *>(&seq), sizeof(seq));
++                        capture_stream.write(reinterpret_cast<const char *>(&pos), sizeof(pos));
++                        capture_stream.write(reinterpret_cast<const char *>(&token), sizeof(token));
++                        for (int32_t j = 0; j < n_embd_enc; ++j) {
++                            uint32_t bits;
++                            std::memcpy(&bits, features + j, sizeof(bits));
++                            bits += 0x7fffU + ((bits >> 16) & 1U); // round-to-nearest-even
++                            capture_bf16_buf[(size_t) j] = (uint16_t) (bits >> 16);
++                        }
++                        capture_stream.write(reinterpret_cast<const char *>(capture_bf16_buf.data()), capture_bf16_buf.size() * sizeof(uint16_t));
++                        ++capture_rows;
++                        ++capture_shard_rows;
++                        if (capture_rotate && capture_shard_rows == capture_shard_max_rows && capture_rows < capture_max_rows) {
++                            capture_finalize_shard();
++                            ++capture_shard_index;
++                            capture_open_shard();
++                        }
++                    }
++                }
++
+                 // fuse extracted features through DFlash encoder
+                 llama_batch enc_batch = {
+                     /*.n_tokens =*/ n_chunk,
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4826ca5..031faff 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -439,6 +439,10 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining - 1);
+         }
+ 
++        // Allow a request to reduce or disable drafting without unloading the
++        // draft model. The server-wide value remains the upper bound.
++        n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 89026eb..3b7e17a 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,13 +194,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+-#if 0
+     // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
+ 
++#if 0
+     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Minimum number of draft tokens to use for speculative decoding");
+@@ -223,6 +222,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+ 
+     add((new field_num("speculative.ngram_min_hits", params.speculative.ngram_simple.min_hits))
+         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
++
+ #endif
+ 
+     add((new field_json("lora"))
