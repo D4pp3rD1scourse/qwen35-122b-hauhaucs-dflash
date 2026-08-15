@@ -1,0 +1,113 @@
+diff --git a/src/speculators/models/dflash/core.py b/src/speculators/models/dflash/core.py
+index e6b0243..558276f 100644
+--- a/src/speculators/models/dflash/core.py
++++ b/src/speculators/models/dflash/core.py
+@@ -296,6 +296,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
+         document_ids: torch.Tensor,  # [1, total_seq_len]
+         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
++        hard_target_ids: torch.Tensor | None = None,
+         **kwargs,
+     ):
+         """Run the anchored-block draft transformer up to the draft logits.
+@@ -347,14 +348,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             anchor_positions, self.block_size
+         )  # shape: [num_anchors*block_size]
+ 
+-        with torch.no_grad():
+-            verifier_logits = self.verifier_lm_head(
+-                self.verifier_norm(verifier_last_hidden_states)
+-            )
+-            # Shift right by 1 so verifier_logits[i] predicts token at position i
+-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+-            targets = verifier_logits[:, anchored_block_indices]
+-            # shape: [1, num_anchors*block_size, draft_vocab_size]
++        if hard_target_ids is not None:
++            targets = hard_target_ids[:, anchored_block_indices]
++        else:
++            with torch.no_grad():
++                verifier_logits = self.verifier_lm_head(
++                    self.verifier_norm(verifier_last_hidden_states)
++                )
++                # Shift right by 1 so verifier_logits[i] predicts token at position i
++                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
++                targets = verifier_logits[:, anchored_block_indices]
++                # shape: [1, num_anchors*block_size, draft_vocab_size]
+ 
+         for layer_idx, layer in enumerate(self.layers):
+             noise_embedding = layer(
+@@ -396,9 +400,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
+         document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
++        hard_target_ids: torch.Tensor | None = None,
+         loss_config: LossConfig | None = None,
+         gamma: float = 4.0,
+         max_anchors: int = 3072,
++        max_speculative_position: int = 15,
+         per_position_loss_weight: str = "fixed-exp-decay",
+         dpace_alpha: float = 0.5,
+         **kwargs,
+@@ -410,9 +416,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             verifier_last_hidden_states,
+             document_ids,
+             position_ids,
++            hard_target_ids=hard_target_ids,
+             max_anchors=max_anchors,
+             **kwargs,
+         )
++        if not 1 <= max_speculative_position < self.block_size:
++            raise ValueError("max_speculative_position must be in [1, block_size)")
++        position = torch.arange(logits.shape[1], device=logits.device) % self.block_size
++        aligned_loss_mask = aligned_loss_mask * (position <= max_speculative_position).unsqueeze(0)
+         loss, metrics = compute_metrics(
+             logits,
+             targets,
+diff --git a/src/speculators/models/dflash/metrics.py b/src/speculators/models/dflash/metrics.py
+index 61d7a7f..1d2f399 100644
+--- a/src/speculators/models/dflash/metrics.py
++++ b/src/speculators/models/dflash/metrics.py
+@@ -12,6 +12,7 @@ from speculators.models.metrics import (
+     dflash_loss_decay,
+     dpace_loss_decay,
+     kl_div_loss,
++    loss_function,
+ )
+ 
+ _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
+@@ -62,17 +63,26 @@ def compute_metrics(
+     else:
+         decay_fn = partial(dflash_loss_decay, gamma=gamma)
+ 
+-    loss, term_losses = compound_loss(
+-        logits,
+-        targets,
+-        loss_mask,
+-        pos_idx,
+-        loss_config=loss_config,
+-        decay_fn=decay_fn,
+-    )
++    if targets.ndim == 2:
++        def hard_ce(draft_logits, target_ids):
++            batch, length, vocab = draft_logits.shape
++            return torch.nn.functional.cross_entropy(
++                draft_logits.reshape(-1, vocab), target_ids.reshape(-1), reduction="none"
++            ).reshape(batch, length)
++        loss = loss_function(logits, targets, loss_mask, pos_idx, loss_fn=hard_ce, decay_fn=decay_fn)
++        term_losses = {}
++    else:
++        loss, term_losses = compound_loss(
++            logits,
++            targets,
++            loss_mask,
++            pos_idx,
++            loss_config=loss_config,
++            decay_fn=decay_fn,
++        )
+ 
+     pred_ids = torch.argmax(logits, dim=-1)
+-    target_ids = torch.argmax(targets, dim=-1)
++    target_ids = targets if targets.ndim == 2 else torch.argmax(targets, dim=-1)
+ 
+     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
+         pred_ids, target_ids, loss_mask, pos_idx, block_size
